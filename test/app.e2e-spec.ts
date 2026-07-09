@@ -1,26 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 import request from 'supertest';
-import {
-  PostgreSqlContainer,
-  StartedPostgreSqlContainer,
-} from '@testcontainers/postgresql';
 import { AppModule } from './../src/app.module';
 import { HttpExceptionFilter } from './../src/interface/filters/http-exception.filter';
+import { DomainExceptionFilter } from './../src/interface/filters/domain-exception.filter';
+import { clearDatabase } from './helpers/database-cleanup';
 
 describe('API (e2e)', () => {
   let app: INestApplication;
-  let container: StartedPostgreSqlContainer;
 
   beforeAll(async () => {
-    container = await new PostgreSqlContainer('postgres:16-alpine')
-      .withDatabase('test_db')
-      .withUsername('test')
-      .withPassword('test')
-      .start();
-
-    process.env.DB_HOST = container.getHost();
-    process.env.DB_PORT = String(container.getPort());
+    process.env.DB_HOST = 'localhost';
+    process.env.DB_PORT = '5433';
     process.env.DB_USERNAME = 'test';
     process.env.DB_PASSWORD = 'test';
     process.env.DB_NAME = 'test_db';
@@ -28,7 +20,7 @@ describe('API (e2e)', () => {
     process.env.DB_LOGGING = 'false';
     process.env.API_PREFIX = 'api/v1';
     process.env.NODE_ENV = 'test';
-  }, 60000);
+  });
 
   beforeEach(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -37,7 +29,7 @@ describe('API (e2e)', () => {
 
     app = moduleFixture.createNestApplication();
     app.setGlobalPrefix('api/v1');
-    app.useGlobalFilters(new HttpExceptionFilter());
+    app.useGlobalFilters(new DomainExceptionFilter(), new HttpExceptionFilter());
     app.useGlobalPipes(
       new ValidationPipe({
         whitelist: true,
@@ -47,15 +39,14 @@ describe('API (e2e)', () => {
     );
 
     await app.init();
+
+    const dataSource = app.get(DataSource);
+    await clearDatabase(dataSource);
   });
 
   afterEach(async () => {
-    await app.close();
+    await app?.close();
   });
-
-  afterAll(async () => {
-    await container?.stop();
-  }, 60000);
 
   describe('Categories', () => {
     it('POST /api/v1/categories - creates a category', async () => {
@@ -107,8 +98,7 @@ describe('API (e2e)', () => {
         .expect(201);
 
       expect(res.body.name).toBe('Papas Sabritas');
-      expect(res.body.stockValue).toBe(0);
-      productId = res.body.id;
+      expect(res.body.stock).toBe(0);
     });
 
     it('PATCH /api/v1/products/:id/stock - adjusts stock', async () => {
@@ -129,7 +119,7 @@ describe('API (e2e)', () => {
         .send({ quantity: 100, reason: 'Initial stock' })
         .expect(200);
 
-      expect(res.body.product.stockValue).toBe(100);
+      expect(res.body.product.stock).toBe(100);
     });
 
     it('PATCH /api/v1/products/:id/stock - rejects negative stock', async () => {
