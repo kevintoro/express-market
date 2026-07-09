@@ -7,6 +7,25 @@ import { HttpExceptionFilter } from './../src/interface/filters/http-exception.f
 import { DomainExceptionFilter } from './../src/interface/filters/domain-exception.filter';
 import { clearDatabase } from './helpers/database-cleanup';
 
+async function waitForAlertStatus(
+  productId: string,
+  expectedStatus: string,
+  app: any,
+  timeout = 3000,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const res = await request(app.getHttpServer())
+      .get(`/api/v1/products/${productId}/alerts`)
+      .expect(200);
+    if (res.body.length > 0 && res.body[0].status === expectedStatus) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(
+    `Expected alert status "${expectedStatus}" not reached within ${timeout}ms`,
+  );
+}
+
 describe('API (e2e)', () => {
   let app: INestApplication;
 
@@ -29,7 +48,10 @@ describe('API (e2e)', () => {
 
     app = moduleFixture.createNestApplication();
     app.setGlobalPrefix('api/v1');
-    app.useGlobalFilters(new DomainExceptionFilter(), new HttpExceptionFilter());
+    app.useGlobalFilters(
+      new DomainExceptionFilter(),
+      new HttpExceptionFilter(),
+    );
     app.useGlobalPipes(
       new ValidationPipe({
         whitelist: true,
@@ -216,6 +238,355 @@ describe('API (e2e)', () => {
         .expect(200);
 
       expect(res.body.status).toBe('RECEIVED');
+    });
+  });
+
+  describe('Alerts', () => {
+    let categoryId: string;
+    let productId: string;
+
+    beforeEach(async () => {
+      const cat = await request(app.getHttpServer())
+        .post('/api/v1/categories')
+        .send({ name: 'Bebidas', description: 'Drinks' })
+        .expect(201);
+      categoryId = cat.body.id;
+
+      const prod = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Gaseosa',
+          sku: 'GASE005',
+          categoryId,
+          price: 10,
+          minStock: 10,
+          supplier: 'Bebidas SA',
+        })
+        .expect(201);
+      productId = prod.body.id;
+    });
+
+    it('creates STOCK_LOW alert when stock drops below minimum', async () => {
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 5, reason: 'Initial stock' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/alerts`)
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].type).toBe('STOCK_LOW');
+      expect(res.body[0].status).toBe('ACTIVE');
+      expect(res.body[0].productId).toBe(productId);
+    });
+
+    it('resolves alert when stock rises above minimum', async () => {
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 5, reason: 'Initial' })
+        .expect(200);
+
+      await waitForAlertStatus(productId, 'ACTIVE', app);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 20, reason: 'Restock' })
+        .expect(200);
+
+      await waitForAlertStatus(productId, 'RESOLVED', app);
+
+      const getRes = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/alerts`)
+        .expect(200);
+      expect(getRes.body.length).toBe(1);
+      expect(getRes.body[0].resolvedAt).toBeDefined();
+    });
+
+    it('does not create duplicate active alerts', async () => {
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 5, reason: 'Initial' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 2, reason: 'More stock' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/alerts`)
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+    });
+  });
+
+  describe('Order Receives and Closes Alert', () => {
+    let productId: string;
+
+    beforeEach(async () => {
+      const cat = await request(app.getHttpServer())
+        .post('/api/v1/categories')
+        .send({ name: 'Limpieza' })
+        .expect(201);
+
+      const prod = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Cloro',
+          sku: 'CLOR006',
+          categoryId: cat.body.id,
+          price: 8,
+          minStock: 10,
+          supplier: 'Químicos SA',
+        })
+        .expect(201);
+      productId = prod.body.id;
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 5, reason: 'Initial' })
+        .expect(200);
+    });
+
+    it('receiving an order auto-closes the active alert', async () => {
+      await waitForAlertStatus(productId, 'ACTIVE', app);
+
+      const order = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .send({ productId, quantity: 25 })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/orders/${order.body.id}/approve`)
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/orders/${order.body.id}/receive`)
+        .expect(200);
+
+      await waitForAlertStatus(productId, 'RESOLVED', app);
+
+      const getRes = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/alerts`)
+        .expect(200);
+      expect(getRes.body.length).toBe(1);
+    });
+  });
+
+  describe('Query Filters', () => {
+    let categoryId: string;
+
+    beforeEach(async () => {
+      const cat = await request(app.getHttpServer())
+        .post('/api/v1/categories')
+        .send({ name: 'Comestibles' })
+        .expect(201);
+      categoryId = cat.body.id;
+    });
+
+    it('filters products by supplier', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Product A',
+          sku: 'SUPPA01',
+          categoryId,
+          price: 10,
+          minStock: 5,
+          supplier: 'Supplier A',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Product B',
+          sku: 'SUPPB01',
+          categoryId,
+          price: 10,
+          minStock: 5,
+          supplier: 'Supplier B',
+        })
+        .expect(201);
+
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/products?supplier=Supplier%20A')
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].name).toBe('Product A');
+    });
+
+    it('filters products by active alert', async () => {
+      const prodA = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Low Stock Product',
+          sku: 'ALERT01',
+          categoryId,
+          price: 10,
+          minStock: 10,
+          supplier: 'Test Supplier',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Well Stocked Product',
+          sku: 'ALERT02',
+          categoryId,
+          price: 10,
+          minStock: 10,
+          supplier: 'Test Supplier',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${prodA.body.id}/stock`)
+        .send({ quantity: 5, reason: 'Low stock' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/products?hasActiveAlert=true')
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].sku).toBe('ALERT01');
+    });
+
+    it('filters products by stock range', async () => {
+      const prodA = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Low Stock',
+          sku: 'RANGE01',
+          categoryId,
+          price: 10,
+          minStock: 5,
+          supplier: 'Supplier',
+        })
+        .expect(201);
+
+      const prodB = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Medium Stock',
+          sku: 'RANGE02',
+          categoryId,
+          price: 10,
+          minStock: 5,
+          supplier: 'Supplier',
+        })
+        .expect(201);
+
+      const prodC = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'High Stock',
+          sku: 'RANGE03',
+          categoryId,
+          price: 10,
+          minStock: 5,
+          supplier: 'Supplier',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${prodA.body.id}/stock`)
+        .send({ quantity: 10, reason: 'Initial' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${prodB.body.id}/stock`)
+        .send({ quantity: 50, reason: 'Initial' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${prodC.body.id}/stock`)
+        .send({ quantity: 100, reason: 'Initial' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/products?stockMin=20&stockMax=60')
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].sku).toBe('RANGE02');
+    });
+  });
+
+  describe('Inventory Movements', () => {
+    let productId: string;
+
+    beforeEach(async () => {
+      const cat = await request(app.getHttpServer())
+        .post('/api/v1/categories')
+        .send({ name: 'Lácteos' })
+        .expect(201);
+
+      const prod = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .send({
+          name: 'Queso',
+          sku: 'QUES007',
+          categoryId: cat.body.id,
+          price: 15,
+          minStock: 10,
+          supplier: 'Lácteos SA',
+        })
+        .expect(201);
+      productId = prod.body.id;
+    });
+
+    it('returns movement history with all required fields', async () => {
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 50, reason: 'Initial stock' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/movements`)
+        .expect(200);
+
+      expect(res.body.length).toBe(1);
+      expect(res.body[0].type).toBe('IN');
+      expect(res.body[0].quantity).toBe(50);
+      expect(res.body[0].reason).toBe('Initial stock');
+      expect(res.body[0].productId).toBe(productId);
+      expect(res.body[0].createdAt).toBeDefined();
+    });
+
+    it('tracks multiple movements in order', async () => {
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 100, reason: 'First shipment' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: -30, reason: 'Sale to customer' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}/stock`)
+        .send({ quantity: 20, reason: 'Restock' })
+        .expect(200);
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}/movements`)
+        .expect(200);
+
+      expect(res.body.length).toBe(3);
+      expect(res.body[0].type).toBe('IN');
+      expect(res.body[0].reason).toBe('Restock');
+      expect(res.body[1].type).toBe('OUT');
+      expect(res.body[1].reason).toBe('Sale to customer');
+      expect(res.body[2].type).toBe('IN');
+      expect(res.body[2].reason).toBe('First shipment');
     });
   });
 });

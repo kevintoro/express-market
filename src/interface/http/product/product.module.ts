@@ -9,10 +9,12 @@ import { ProductOrmEntity } from '../../../infrastructure/database/typeorm/entit
 import { InventoryMovementOrmEntity } from '../../../infrastructure/database/typeorm/entities/inventory-movement.orm-entity';
 import { ProductRepositoryPort } from '../../../domain/product/ports/product.repository.port';
 import { InventoryMovementRepositoryPort } from '../../../domain/product/ports/inventory-movement.repository.port';
+import { StockAlertModule } from '../stock-alert/stock-alert.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([ProductOrmEntity, InventoryMovementOrmEntity]),
+    StockAlertModule,
   ],
   controllers: [ProductController],
   providers: [

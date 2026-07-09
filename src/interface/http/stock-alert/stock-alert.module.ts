@@ -17,5 +17,6 @@ import { ProductRepositoryPort } from '../../../domain/product/ports/product.rep
     { provide: StockAlertRepositoryPort, useClass: StockAlertRepositoryImpl },
     { provide: ProductRepositoryPort, useClass: ProductRepositoryImpl },
   ],
+  exports: [StockAlertService],
 })
 export class StockAlertModule {}

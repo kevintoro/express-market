@@ -50,4 +50,8 @@ export class InventoryService {
 
     return { product, movement: savedMovement };
   }
+
+  async getMovements(productId: string): Promise<InventoryMovement[]> {
+    return this.movementRepo.findByProductId(productId);
+  }
 }
